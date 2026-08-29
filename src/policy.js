@@ -1,3 +1,5 @@
+export const BUILTIN_LOCATION = "<built-in>"
+
 export function isExplicitOnly(markdown) {
   if (typeof markdown !== "string") return false
   const front = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/)

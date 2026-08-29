@@ -17,7 +17,4 @@ export async function createAutoinvokeGateHooks() {
   }
 }
 
-export const SupercodeAutoinvokeSkillGate = createAutoinvokeGateHooks
-export const AutoinvokeSkillGate = createAutoinvokeGateHooks
-
 export default createAutoinvokeGateHooks
