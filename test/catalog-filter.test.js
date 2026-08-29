@@ -1,8 +1,9 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { isExplicitOnly } from "../src/policy.js"
+import { isExplicitOnly, classifyRecord } from "../src/policy.js"
 import { filterSystem, createCatalogFilter } from "../src/filter.js"
 import { createAutoinvokeGateHooks } from "../plugin/gate.js"
+import path from "node:path"
 
 function skillEntry(name, description, location) {
   return [
@@ -272,4 +273,306 @@ test("explicit invocation not blocked: filtering catalog does not affect tool av
   const hooks = await createAutoinvokeGateHooks()
   // No tool guard, so skill tool remains allowed at permission layer
   assert.equal(typeof hooks["tool.execute.before"], "undefined")
+})
+
+// === 02: Portable marker policy и immutable snapshot ===
+
+const META_FALSE_MD = `---
+name: meta-skill
+description: meta
+metadata:
+  opencode/autoinvoke: false
+---
+body`
+
+const META_TRUE_MD = `---
+name: meta-skill
+description: meta
+metadata:
+  opencode/autoinvoke: true
+---
+body`
+
+const META_QUOTED_MD = `---
+name: meta-skill
+metadata:
+  opencode/autoinvoke: "false"
+---
+body`
+
+const SIDECAR_FALSE = `policy:
+  allow_implicit_invocation: false
+`
+
+const SIDECAR_TRUE = `policy:
+  allow_implicit_invocation: true
+`
+
+const SIDECAR_QUOTED = `policy:
+  allow_implicit_invocation: "false"
+`
+
+function throwingReader(map, errorPath, error) {
+  return async (loc) => {
+    if (loc === errorPath) throw error
+    if (map.has(loc)) return map.get(loc)
+    const e = new Error(`ENOENT: ${loc}`)
+    e.code = "ENOENT"
+    throw e
+  }
+}
+
+test("filterSystem recognizes metadata.opencode/autoinvoke: false as Explicit-only", async () => {
+  const map = new Map([["/m/SKILL.md", META_FALSE_MD]])
+  const out = { system: [catalog([skillEntry("m", "M", "/m/SKILL.md")])] }
+  await filterSystem(out, reader(map))
+  assert.doesNotMatch(out.system[0], /\/m\/SKILL\.md/)
+})
+
+test("filterSystem recognizes sidecar policy.allow_implicit_invocation: false as Explicit-only", async () => {
+  const map = new Map([
+    ["/s/SKILL.md", UNMARKED_MD],
+    ["/s/agents/openai.yaml", SIDECAR_FALSE],
+  ])
+  const out = { system: [catalog([skillEntry("s", "S", "/s/SKILL.md")])] }
+  await filterSystem(out, reader(map))
+  assert.doesNotMatch(out.system[0], /\/s\/SKILL\.md/)
+})
+
+test("only YAML boolean counts — quoted, number, null, array stay visible", async () => {
+  const mdQuotedMeta = META_QUOTED_MD
+  const mdNum = `---
+name: x
+disable-model-invocation: 1
+---
+body`
+  const mdNull = `---
+name: x
+disable-model-invocation: null
+---
+body`
+  const mdArray = `---
+name: x
+disable-model-invocation: [true]
+---
+body`
+  const map = new Map([
+    ["/q/SKILL.md", mdQuotedMeta],
+    ["/n/SKILL.md", mdNum],
+    ["/null/SKILL.md", mdNull],
+    ["/arr/SKILL.md", mdArray],
+  ])
+  const entries = [
+    skillEntry("q", "Q", "/q/SKILL.md"),
+    skillEntry("n", "N", "/n/SKILL.md"),
+    skillEntry("null", "N", "/null/SKILL.md"),
+    skillEntry("arr", "A", "/arr/SKILL.md"),
+  ]
+  const out = { system: [catalog(entries)] }
+  await filterSystem(out, reader(map))
+  for (const e of entries) assert.match(out.system[0], new RegExp(e.match(/<name>(.*?)<\/name>/)[1]))
+  const r1 = classifyRecord({ skillContent: mdQuotedMeta, sidecarMissing: true })
+  assert.ok(r1.warnings.some((w) => w.includes("invalid type")))
+  const r2 = classifyRecord({ skillContent: mdNum, sidecarMissing: true })
+  assert.ok(r2.warnings.some((w) => w.includes("invalid type")))
+})
+
+test("ANY valid denying marker makes Explicit-only; allowing marker does not cancel and creates warning", async () => {
+  const mdConflict = `---
+name: x
+disable-model-invocation: true
+metadata:
+  opencode/autoinvoke: true
+---
+body`
+  const r = classifyRecord({ skillContent: mdConflict, sidecarMissing: true })
+  assert.equal(r.explicitOnly, true)
+  assert.ok(r.warnings.some((w) => w.includes("conflicting")))
+
+  const mdWithSidecarAllow = `---
+name: x
+disable-model-invocation: true
+---
+body`
+  const r2 = classifyRecord({ skillContent: mdWithSidecarAllow, sidecarContent: SIDECAR_TRUE, sidecarMissing: false })
+  assert.equal(r2.explicitOnly, true)
+  assert.ok(r2.warnings.some((w) => w.includes("conflicting")))
+
+  const map = new Map([
+    ["/c/SKILL.md", mdConflict],
+  ])
+  const out = { system: [catalog([skillEntry("c", "C", "/c/SKILL.md")])] }
+  await filterSystem(out, reader(map))
+  assert.doesNotMatch(out.system[0], /\/c\/SKILL\.md/)
+})
+
+test("absent marker and absent optional sidecar produce no warning", () => {
+  const r = classifyRecord({ skillContent: UNMARKED_MD, sidecarMissing: true })
+  assert.equal(r.warnings.length, 0)
+  assert.equal(r.explicitOnly, false)
+})
+
+test("malformed YAML, read error, wrong type, duplicate ambiguous fail-open with warning; other valid deny still applies", async () => {
+  const badSkill = `---
+name: x
+disable-model-invocation: [
+---
+body`
+  const sidecarDeny = SIDECAR_FALSE
+  const r = classifyRecord({ skillContent: badSkill, sidecarContent: sidecarDeny, sidecarMissing: false })
+  assert.equal(r.explicitOnly, true, "sidecar deny still applies despite skill malformed")
+  assert.ok(r.warnings.some((w) => w.includes("malformed")))
+
+  const readErr = Object.assign(new Error("EACCES"), { code: "EACCES" })
+  const mdAllow = `---
+name: x
+disable-model-invocation: false
+---
+body`
+  const r2 = classifyRecord({ skillContent: mdAllow, skillReadError: readErr, sidecarContent: sidecarDeny, sidecarMissing: false })
+  assert.equal(r2.explicitOnly, true)
+  assert.ok(r2.warnings.some((w) => w.includes("read error")))
+
+  const mdWrong = `---
+name: x
+disable-model-invocation: "true"
+metadata:
+  opencode/autoinvoke: false
+---
+body`
+  const r3 = classifyRecord({ skillContent: mdWrong, sidecarMissing: true })
+  assert.equal(r3.explicitOnly, true, "metadata deny still applies despite disable wrong type")
+  assert.ok(r3.warnings.some((w) => w.includes("invalid type")))
+
+  const dup = `---
+name: x
+disable-model-invocation: true
+disable-model-invocation: false
+---
+body`
+  const rDup = classifyRecord({ skillContent: dup, sidecarMissing: true })
+  assert.equal(rDup.explicitOnly, false, "duplicate ambiguous fail-open")
+  assert.ok(rDup.warnings.some((w) => w.includes("duplicate") || w.includes("ambiguous")))
+
+  // via filterSystem: malformed skill stays visible if no other deny
+  const mapBad = new Map([["/bad/SKILL.md", badSkill]])
+  const outBad = { system: [catalog([skillEntry("bad", "B", "/bad/SKILL.md")])] }
+  await filterSystem(outBad, reader(mapBad))
+  assert.match(outBad.system[0], /bad/, "malformed without other deny stays visible")
+
+  // via filterSystem: wrong type stays visible
+  const mapWrong = new Map([["/w/SKILL.md", `---\ndisable-model-invocation: "true"\n---\nbody`]])
+  const outWrong = { system: [catalog([skillEntry("w", "W", "/w/SKILL.md")])] }
+  await filterSystem(outWrong, reader(mapWrong))
+  assert.match(outWrong.system[0], /W/)
+})
+
+test("source of truth is actual <name> and <location>; duplicate name in other location does not affect selected record", async () => {
+  const map = new Map([
+    ["/a/SKILL.md", MARKED_MD],
+    ["/b/SKILL.md", UNMARKED_MD],
+  ])
+  const out = { system: [catalog([skillEntry("dup", "D", "/a/SKILL.md"), skillEntry("dup", "D", "/b/SKILL.md")])] }
+  await filterSystem(out, reader(map))
+  assert.doesNotMatch(out.system[0], /\/a\/SKILL\.md/)
+  assert.match(out.system[0], /\/b\/SKILL\.md/)
+
+  const out2 = { system: [catalog([skillEntry("dup", "D", "/b/SKILL.md")])] }
+  await filterSystem(out2, reader(map))
+  assert.match(out2.system[0], /\/b\/SKILL\.md/)
+})
+
+test("location safely resolves via symlink alias; metadata read only at selected file and adjacent sidecar", async () => {
+  const map = new Map([
+    ["/real/SKILL.md", MARKED_MD],
+    ["/real/agents/openai.yaml", SIDECAR_TRUE],
+  ])
+  const read = async (p) => {
+    if (map.has(p)) return map.get(p)
+    const e = new Error(`ENOENT: ${p}`)
+    e.code = "ENOENT"
+    throw e
+  }
+  const realpath = async (p) => (p === "/link/SKILL.md" ? "/real/SKILL.md" : p)
+  const filter = createCatalogFilter(read, { realpath })
+  const out = { system: [catalog([skillEntry("linkskill", "L", "/link/SKILL.md")])] }
+  await filter(out)
+  assert.doesNotMatch(out.system[0], /\/link\/SKILL\.md/)
+  assert.ok(filter.getWarnings().some((w) => w.includes("conflicting")))
+})
+
+test("metadata read once at first model request; changes after ignored until restart", async () => {
+  const map = new Map([
+    ["/a/SKILL.md", MARKED_MD],
+    ["/b/SKILL.md", UNMARKED_MD],
+  ])
+  const read = async (p) => {
+    if (map.has(p)) return map.get(p)
+    const e = new Error(`ENOENT: ${p}`)
+    e.code = "ENOENT"
+    throw e
+  }
+  const filter = createCatalogFilter(read)
+  const entries = [skillEntry("a", "A", "/a/SKILL.md"), skillEntry("b", "B", "/b/SKILL.md")]
+  const out1 = { system: [catalog(entries)] }
+  await filter(out1)
+  assert.doesNotMatch(out1.system[0], /\/a\/SKILL\.md/)
+  assert.match(out1.system[0], /\/b\/SKILL\.md/)
+
+  map.set("/a/SKILL.md", UNMARKED_MD)
+  map.set("/b/SKILL.md", MARKED_MD)
+  const out2 = { system: [catalog(entries)] }
+  await filter(out2)
+  assert.doesNotMatch(out2.system[0], /\/a\/SKILL\.md/, "snapshot immutable: a still filtered")
+  assert.match(out2.system[0], /\/b\/SKILL\.md/, "snapshot immutable: b still visible")
+})
+
+test("identities not in first snapshot are preserved fail-open and do not trigger rescan", async () => {
+  const map = new Map([["/a/SKILL.md", UNMARKED_MD]])
+  const read = async (p) => {
+    if (map.has(p)) return map.get(p)
+    const e = new Error(`ENOENT: ${p}`)
+    e.code = "ENOENT"
+    throw e
+  }
+  const filter = createCatalogFilter(read)
+  const out1 = { system: [catalog([skillEntry("a", "A", "/a/SKILL.md")])] }
+  await filter(out1)
+  assert.match(out1.system[0], /\/a\/SKILL\.md/)
+
+  map.set("/c/SKILL.md", MARKED_MD)
+  const out2 = { system: [catalog([skillEntry("a", "A", "/a/SKILL.md"), skillEntry("c", "C", "/c/SKILL.md")])] }
+  await filter(out2)
+  assert.match(out2.system[0], /\/c\/SKILL\.md/, "unknown identity fail-open")
+})
+
+test("deduplicated warnings not spammed on repeated transforms", async () => {
+  const map = new Map([["/a/SKILL.md", `---\ndisable-model-invocation: "true"\n---\nbody`]])
+  const read = async (p) => {
+    if (map.has(p)) return map.get(p)
+    const e = new Error(`ENOENT: ${p}`)
+    e.code = "ENOENT"
+    throw e
+  }
+  const filter = createCatalogFilter(read)
+  const out1 = { system: [catalog([skillEntry("a", "A", "/a/SKILL.md")])] }
+  await filter(out1)
+  const w1 = filter.getWarnings()
+  assert.equal(w1.length, 1)
+  const out2 = { system: [catalog([skillEntry("a", "A", "/a/SKILL.md")])] }
+  await filter(out2)
+  const w2 = filter.getWarnings()
+  assert.equal(w2.length, 1, "warnings not duplicated on second transform")
+})
+
+test("filterSystem and snapshot filter handle three markers via same seam (integration)", async () => {
+  const map = new Map([
+    ["/x/SKILL.md", `---\nmetadata:\n  opencode/autoinvoke: false\n---\nbody`],
+    ["/y/SKILL.md", UNMARKED_MD],
+    ["/y/agents/openai.yaml", SIDECAR_FALSE],
+  ])
+  const out = { system: [catalog([skillEntry("x", "X", "/x/SKILL.md"), skillEntry("y", "Y", "/y/SKILL.md")])] }
+  await filterSystem(out, reader(map))
+  assert.doesNotMatch(out.system[0], /\/x\/SKILL\.md/)
+  assert.doesNotMatch(out.system[0], /\/y\/SKILL\.md/)
 })

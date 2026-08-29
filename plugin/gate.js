@@ -1,18 +1,16 @@
-import { readFile } from "node:fs/promises"
-import { filterSystem } from "../src/filter.js"
+import { readFile, realpath } from "node:fs/promises"
+import { createCatalogFilter } from "../src/filter.js"
 
-async function readSkillFile(location) {
-  try {
-    return await readFile(location, "utf8")
-  } catch {
-    return undefined
-  }
+async function readFileGeneric(filePath) {
+  return await readFile(filePath, "utf8")
 }
 
 export async function createAutoinvokeGateHooks() {
+  const filter = createCatalogFilter(readFileGeneric, { realpath })
+
   return {
     "experimental.chat.system.transform": async (_input, output) => {
-      await filterSystem(output, readSkillFile)
+      await filter(output)
     },
   }
 }

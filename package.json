@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "supercode-autoinvoke-skill-gate",
   "version": "0.1.0",
-  "description": "OpenCode plugin that hides Claude-marked Explicit-only skills from the model-facing <available_skills> catalog",
+  "description": "OpenCode plugin that hides Explicit-only skills (Claude Code, Codex, OpenCode v2 portable markers) from the model-facing <available_skills> catalog",
   "type": "module",
   "license": "MIT",
   "author": "Supercode",

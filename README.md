@@ -1,6 +1,6 @@
 # supercode-autoinvoke-skill-gate
 
-OpenCode `v1` plugin that hides Explicit-only skills from the model-facing `<available_skills>` catalog. A skill marked with `disable-model-invocation: true` (YAML boolean) in its `SKILL.md` frontmatter is removed from the catalog so the model does not auto-select it. Ordinary skills stay, explicit `/skill-name` and `skill({ name })` calls remain allowed.
+OpenCode `v1` plugin that hides Explicit-only skills from the model-facing `<available_skills>` catalog. A skill carrying any one valid denying marker is removed from the catalog so the model does not auto-select it. Ordinary skills stay, explicit `/skill-name` and `skill({ name })` calls remain allowed.
 
 ## Install
 
@@ -25,14 +25,40 @@ Restart OpenCode after saving.
 
 ## What it does
 
-- Hooks `experimental.chat.system.transform` only.
-- Parses each `<available_skills>…</available_skills>` block, extracts `<location>` per `<skill>`, reads that `SKILL.md`, and drops the whole `<skill>` record when `disable-model-invocation: true` (unquoted YAML boolean). Neighbors, order, and surrounding system text stay byte-for-byte.
-- Mutates `output.system` in place (array identity preserved, only catalog-containing elements changed).
-- No `tool.execute.before` or invocation guard — explicit `/skill-name` and tool `skill` with a known name stay allowed.
-- Missing catalog is a no-op. Filtering all records leaves an empty `<available_skills>\n</available_skills>` via the same generic path (no special branch/text).
-- Happy path is silent: no log, no toast.
+- Hooks `experimental.chat.system.transform` only — no `tool.execute.before` or invocation guard.
+- Parses each `<available_skills>…</available_skills>` block, extracts `<name>` + `<location>` per `<skill>` (the OpenCode-selected records are the source of truth), and drops the whole `<skill>` record when it is Explicit-only.
+- Mutates `output.system` in place (array identity preserved, only catalog-containing elements changed). Neighbors, order, and surrounding system text stay byte-for-byte.
+- Missing catalog is a no-op. Filtering all records leaves an empty `<available_skills>\n</available_skills>` via the same generic path.
+- Happy path is silent. Recoverable metadata warnings are deduped and logged; TUI toast is best-effort, headless fallback is the log.
+- No configuration key — installing the package enables filtering, removing it restores native behavior.
 
-## Frontmatter
+## Portable markers (ANY denial)
+
+Exactly three portable markers are recognized — all require YAML **boolean** `true`/`false` (quoted strings, numbers, `null`, arrays never coerce):
+
+| Ecosystem | File | Field | Denying value |
+| --- | --- | --- | --- |
+| Claude Code | `SKILL.md` frontmatter | `disable-model-invocation` | `true` |
+| Codex | adjacent `agents/openai.yaml` | `policy.allow_implicit_invocation` | `false` |
+| OpenCode v2 compat | `SKILL.md` frontmatter | `metadata.opencode/autoinvoke` | `false` |
+
+Any one valid denying value makes the **selected** `<name>` + `<location>` record Explicit-only. A valid allowing value (`false` / `true` / `true` respectively) from another ecosystem never cancels a valid denial and produces a single conflict warning; the record stays filtered.
+
+Absent marker and absent optional `agents/openai.yaml` are normal (no warning). Malformed YAML, read errors, wrong type for a known field, and duplicate/ambiguous keys fail open for that marker and produce a deduplicated warning — a different valid denying marker on the same record still filters it.
+
+Duplicate skill names with different `<location>` are distinct policy subjects. The duplicate copy on disk never classifies the selected record.
+
+Location is resolved safely across symlink aliases (`realpath`): catalog identity stays the original `<location>`, metadata is read from the canonical file and its adjacent `agents/openai.yaml`.
+
+## Snapshot
+
+Policy is built lazily at the **first** model request that exposes the catalog. The snapshot covers the effective catalog identities present then and is immutable until the OpenCode process restarts:
+
+- Edits made before the first request are included.
+- Edits to `SKILL.md`, `agents/openai.yaml`, or the catalog after the snapshot are not reread.
+- Identities not present in the first snapshot are preserved fail-open on later transforms and do not trigger a second scan.
+
+## Frontmatter examples
 
 ```md
 ---
@@ -42,7 +68,23 @@ disable-model-invocation: true
 ---
 ```
 
-Only unquoted `true` counts. Quoted `"true"` / `'true'`, numbers, or other types do not hide the skill.
+```md
+---
+name: my-private-skill
+description: does a niche thing
+metadata:
+  opencode/autoinvoke: false
+---
+```
+
+`agents/openai.yaml` next to `SKILL.md`:
+
+```yaml
+policy:
+  allow_implicit_invocation: false
+```
+
+Only unquoted booleans count. `disable-model-invocation: "true"` stays visible (with a warning).
 
 ## Verify
 
@@ -50,7 +92,7 @@ Only unquoted `true` counts. Quoted `"true"` / `'true'`, numbers, or other types
 npm test
 ```
 
-Tests run via the Catalog Policy/Filter seam (`src/filter.js` + `src/policy.js`) without a live OpenCode server.
+Tests run via the Catalog Policy/Filter seam (`src/filter.js` + `src/policy.js`) and cover: three markers, ANY-denial, conflicts, exact YAML boolean vs quoted/number/null/array, malformed/read errors, duplicate names with different locations, symlink alias, and immutable snapshot (unknown identities preserved fail-open).
 
 ## Uninstall
 
