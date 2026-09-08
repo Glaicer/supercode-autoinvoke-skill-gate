@@ -9,11 +9,15 @@ const manifest = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"))
 const target = manifest.exports?.["."];
 
 assert.equal(target, "./dist/gate.js", "root export must be compiled JavaScript");
+assert.equal(manifest.exports?.["./server"], "./dist/gate.js", "server export must resolve to the gate entry");
 
 for (const entry of ["./dist/gate.js", "./dist/filter.js", "./dist/policy.js"]) {
   const code = readFileSync(resolve(root, entry), "utf8");
   assert.doesNotMatch(code, /from ["'][^"']+\.ts["']/, `compiled ${entry} must not import TypeScript`);
 }
+
+const gateCode = readFileSync(resolve(root, "./dist/gate.js"), "utf8");
+assert.match(gateCode, /export default /, "compiled gate must keep a default export for loaders that require one");
 
 const packed = JSON.parse(
   execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
