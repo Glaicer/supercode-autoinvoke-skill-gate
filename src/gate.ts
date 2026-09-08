@@ -18,5 +18,3 @@ export async function createAutoinvokeGateHooks(): Promise<GateHooks> {
     },
   };
 }
-
-export default createAutoinvokeGateHooks;
