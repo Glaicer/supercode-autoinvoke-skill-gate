@@ -81,14 +81,17 @@ function classifyScalar(v: string): ScalarClassification {
   return { type: "string", raw };
 }
 
+const SCALAR_TYPE_LABELS: Record<string, string> = {
+  string: "string",
+  number: "number",
+  null: "null",
+  array: "array",
+  object: "object",
+  empty: "empty",
+};
+
 function typeLabelForWarning(t: ScalarKind | string | undefined): string {
-  if (t === "string") return "string";
-  if (t === "number") return "number";
-  if (t === "null") return "null";
-  if (t === "array") return "array";
-  if (t === "object") return "object";
-  if (t === "empty") return "empty";
-  return t || "unknown";
+  return (t !== undefined && SCALAR_TYPE_LABELS[t]) || (t as string) || "unknown";
 }
 
 export interface MarkerState {
@@ -139,206 +142,173 @@ interface StackFrame {
   key: string;
 }
 
-export function parseSkillYaml(yamlText: string): ParsedSkillYaml {
+/** Record a scalar as a boolean marker: booleans set the value, anything else is a wrong-type warning. */
+function applyBooleanMarker(marker: MarkerState, rawValue: string): void {
+  const ci = classifyScalar(rawValue);
+  if (ci.type === "boolean") {
+    marker.isBoolean = true;
+    marker.value = ci.booleanValue;
+  } else {
+    marker.wrongType = true;
+    marker.wrongTypeDetail = typeLabelForWarning(ci.type);
+  }
+}
+
+export interface YamlMapping {
+  fullPath: string;
+  valueWithoutComment: string;
+}
+
+export interface YamlWalkHandlers {
+  /** Colon-less lines the dialect tolerates (list items, document-end markers); anything else is malformed. */
+  isToleratedBareLine: (trimmedLine: string) => boolean;
+  /** Tag duplicate keys the dialect treats as ambiguous. */
+  onDuplicatePath: (fullPath: string) => void;
+  /** Handle a mapping line that carries a scalar value (map parents and flow collections are consumed here). */
+  onMapping: (mapping: YamlMapping) => void;
+}
+
+export interface YamlWalkResult {
+  warnings: string[];
+  malformed: boolean;
+  malformedMsg: string | null;
+}
+
+/**
+ * Shared line walker for the flat key/value YAML subset both dialects parse:
+ * comment/blank skipping, `key: value` splitting, indent-stack path tracking,
+ * duplicate detection, and unclosed-flow checks. Dialect differences
+ * (tolerated bare lines, ambiguous keys, marker extraction) arrive via handlers.
+ */
+export function walkYamlLines(yamlText: string, handlers: YamlWalkHandlers): YamlWalkResult {
   const lines = yamlText.split(/\r?\n/);
+  const warnings: string[] = [];
+  let malformed = false;
+  let malformedMsg: string | null = null;
+  const seen = new Map<string, number>();
+  const stack: StackFrame[] = [];
+
+  for (let idx = 0; idx < lines.length; idx++) {
+    const rawLine: string = lines[idx] ?? "";
+    const trimmed = rawLine.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const kvMatch = rawLine.match(/^(\s*)([^:]+?)\s*:\s*(.*)$/);
+    if (!kvMatch) {
+      if (!handlers.isToleratedBareLine(trimmed)) {
+        malformed = true;
+        malformedMsg = `line ${idx + 1}: missing ':'`;
+      }
+      continue;
+    }
+    const indent = (kvMatch[1] || "").length;
+    const key = unquoteKey(kvMatch[2] ?? "");
+    const rawValueFull = kvMatch[3] ?? "";
+
+    while (stack.length > 0 && indent <= (stack[stack.length - 1]?.indent ?? 0)) stack.pop();
+    const parentPath = stack.map((s) => s.key).join(".");
+    const fullPath = parentPath ? `${parentPath}.${key}` : key;
+
+    const seenCount = seen.get(fullPath) || 0;
+    if (seenCount > 0) {
+      warnings.push(`duplicate key "${fullPath}"`);
+      handlers.onDuplicatePath(fullPath);
+    }
+    seen.set(fullPath, seenCount + 1);
+
+    const valueWithoutComment = stripComment(rawValueFull).trim();
+
+    if (valueWithoutComment.startsWith("[") && !valueWithoutComment.includes("]")) {
+      malformed = true;
+      malformedMsg = `line ${idx + 1}: unclosed '['`;
+      continue;
+    }
+    if (valueWithoutComment.startsWith("{") && !valueWithoutComment.includes("}")) {
+      malformed = true;
+      malformedMsg = `line ${idx + 1}: unclosed '{'`;
+      continue;
+    }
+
+    if (valueWithoutComment === "") {
+      // Map node or empty value: push for nested handling regardless.
+      stack.push({ indent, key });
+      continue;
+    }
+
+    handlers.onMapping({ fullPath, valueWithoutComment });
+  }
+
+  return { warnings, malformed, malformedMsg };
+}
+
+export function parseSkillYaml(yamlText: string): ParsedSkillYaml {
   const markers: SkillYamlMarkers = {
     disable: emptyMarker(),
     metadata: emptyMarker(),
   };
-  const warnings: string[] = [];
-  let malformed = false;
-  let malformedMsg: string | null = null;
-  const seen = new Map<string, number>();
-  const stack: StackFrame[] = [];
-
-  for (let idx = 0; idx < lines.length; idx++) {
-    const rawLine: string = lines[idx] ?? "";
-    if (rawLine.trim() === "" || rawLine.trim().startsWith("#")) continue;
-    const kvMatch = rawLine.match(/^(\s*)([^:]+?)\s*:\s*(.*)$/);
-    if (!kvMatch) {
-      // line without colon -> malformed if not empty
-      if (rawLine.trim() !== "" && !rawLine.trim().startsWith("-") && !rawLine.trim().startsWith("...")) {
-        malformed = true;
-        malformedMsg = `line ${idx + 1}: missing ':'`;
-      }
-      continue;
-    }
-    const indentStr = kvMatch[1] || "";
-    const indent = indentStr.length;
-    const rawKey = kvMatch[2] ?? "";
-    const rawValueFull = kvMatch[3] ?? "";
-
-    const key = unquoteKey(rawKey);
-    while (stack.length > 0 && indent <= (stack[stack.length - 1]?.indent ?? 0)) stack.pop();
-    const parentPath = stack.map((s) => s.key).join(".");
-    const fullPath = parentPath ? `${parentPath}.${key}` : key;
-
-    const seenCount = seen.get(fullPath) || 0;
-    if (seenCount > 0) {
-      warnings.push(`duplicate key "${fullPath}"`);
+  const walked = walkYamlLines(yamlText, {
+    isToleratedBareLine: (trimmed) => trimmed.startsWith("-") || trimmed.startsWith("..."),
+    onDuplicatePath: (fullPath) => {
       if (fullPath === "disable-model-invocation") markers.disable.ambiguous = true;
       if (fullPath === "metadata.opencode/autoinvoke") markers.metadata.ambiguous = true;
-    }
-    seen.set(fullPath, seenCount + 1);
-
-    const valueWithoutComment = stripComment(rawValueFull).trim();
-
-    if (valueWithoutComment.startsWith("[") && !valueWithoutComment.includes("]")) {
-      malformed = true;
-      malformedMsg = `line ${idx + 1}: unclosed '['`;
-      continue;
-    }
-    if (valueWithoutComment.startsWith("{") && !valueWithoutComment.includes("}")) {
-      malformed = true;
-      malformedMsg = `line ${idx + 1}: unclosed '{'`;
-      continue;
-    }
-
-    if (valueWithoutComment === "") {
-      // could be map node or empty value -> push stack if expecting children
-      // check if this is a known map parent like metadata
-      // we push regardless for nested handling
-      stack.push({ indent, key });
-      continue;
-    }
-
-    // handle inline mapping for metadata parent
-    if (fullPath === "metadata" && valueWithoutComment.startsWith("{")) {
-      const inner = valueWithoutComment.match(/["']?opencode\/autoinvoke["']?\s*:\s*([^,}]+)/);
-      if (inner) {
-        const innerRaw = stripComment(inner[1] ?? "").trim();
-        if (markers.metadata.exists) markers.metadata.ambiguous = true;
-        markers.metadata.exists = true;
-        const ci = classifyScalar(innerRaw);
-        if (ci.type === "boolean") {
-          markers.metadata.isBoolean = true;
-          markers.metadata.value = ci.booleanValue;
-        } else {
-          markers.metadata.wrongType = true;
-          markers.metadata.wrongTypeDetail = typeLabelForWarning(ci.type);
+    },
+    onMapping: ({ fullPath, valueWithoutComment }) => {
+      // handle inline mapping for metadata parent
+      if (fullPath === "metadata" && valueWithoutComment.startsWith("{")) {
+        const inner = valueWithoutComment.match(/["']?opencode\/autoinvoke["']?\s*:\s*([^,}]+)/);
+        if (inner) {
+          const innerRaw = stripComment(inner[1] ?? "").trim();
+          if (markers.metadata.exists) markers.metadata.ambiguous = true;
+          markers.metadata.exists = true;
+          applyBooleanMarker(markers.metadata, innerRaw);
         }
+        return;
       }
-      continue;
-    }
 
-    if (fullPath === "disable-model-invocation") {
-      markers.disable.exists = true;
-      const ci = classifyScalar(valueWithoutComment);
-      if (ci.type === "boolean") {
-        markers.disable.isBoolean = true;
-        markers.disable.value = ci.booleanValue;
+      if (fullPath === "disable-model-invocation") {
+        markers.disable.exists = true;
+        applyBooleanMarker(markers.disable, valueWithoutComment);
+      } else if (fullPath === "metadata.opencode/autoinvoke") {
+        markers.metadata.exists = true;
+        applyBooleanMarker(markers.metadata, valueWithoutComment);
       } else {
-        markers.disable.wrongType = true;
-        markers.disable.wrongTypeDetail = typeLabelForWarning(ci.type);
+        // other keys: no special handling
       }
-    } else if (fullPath === "metadata.opencode/autoinvoke") {
-      markers.metadata.exists = true;
-      const ci = classifyScalar(valueWithoutComment);
-      if (ci.type === "boolean") {
-        markers.metadata.isBoolean = true;
-        markers.metadata.value = ci.booleanValue;
-      } else {
-        markers.metadata.wrongType = true;
-        markers.metadata.wrongTypeDetail = typeLabelForWarning(ci.type);
-      }
-    } else {
-      // other keys: no special handling
-    }
-  }
+    },
+  });
 
-  return { markers, warnings, malformed, malformedMsg };
+  return { markers, warnings: walked.warnings, malformed: walked.malformed, malformedMsg: walked.malformedMsg };
 }
 
 export function parseSidecarYaml(yamlText: string): ParsedSidecarYaml {
-  const lines = yamlText.split(/\r?\n/);
   const markers: SidecarYamlMarkers = {
     sidecar: emptyMarker(),
   };
-  const warnings: string[] = [];
-  let malformed = false;
-  let malformedMsg: string | null = null;
-  const seen = new Map<string, number>();
-  const stack: StackFrame[] = [];
-
-  for (let idx = 0; idx < lines.length; idx++) {
-    const rawLine: string = lines[idx] ?? "";
-    if (rawLine.trim() === "" || rawLine.trim().startsWith("#")) continue;
-    const kvMatch = rawLine.match(/^(\s*)([^:]+?)\s*:\s*(.*)$/);
-    if (!kvMatch) {
-      if (rawLine.trim() !== "" && !rawLine.trim().startsWith("-")) {
-        malformed = true;
-        malformedMsg = `line ${idx + 1}: missing ':'`;
-      }
-      continue;
-    }
-    const indentStr = kvMatch[1] || "";
-    const indent = indentStr.length;
-    const rawKey = kvMatch[2] ?? "";
-    const rawValueFull = kvMatch[3] ?? "";
-    const key = unquoteKey(rawKey);
-    while (stack.length > 0 && indent <= (stack[stack.length - 1]?.indent ?? 0)) stack.pop();
-    const parentPath = stack.map((s) => s.key).join(".");
-    const fullPath = parentPath ? `${parentPath}.${key}` : key;
-
-    const seenCount = seen.get(fullPath) || 0;
-    if (seenCount > 0) {
-      warnings.push(`duplicate key "${fullPath}"`);
+  const walked = walkYamlLines(yamlText, {
+    isToleratedBareLine: (trimmed) => trimmed.startsWith("-"),
+    onDuplicatePath: (fullPath) => {
       if (fullPath === "policy.allow_implicit_invocation") markers.sidecar.ambiguous = true;
-    }
-    seen.set(fullPath, seenCount + 1);
-
-    const valueWithoutComment = stripComment(rawValueFull).trim();
-
-    if (valueWithoutComment.startsWith("[") && !valueWithoutComment.includes("]")) {
-      malformed = true;
-      malformedMsg = `line ${idx + 1}: unclosed '['`;
-      continue;
-    }
-    if (valueWithoutComment.startsWith("{") && !valueWithoutComment.includes("}")) {
-      malformed = true;
-      malformedMsg = `line ${idx + 1}: unclosed '{'`;
-      continue;
-    }
-
-    if (valueWithoutComment === "") {
-      stack.push({ indent, key });
-      continue;
-    }
-
-    // inline policy mapping
-    if (fullPath === "policy" && valueWithoutComment.startsWith("{")) {
-      const inner = valueWithoutComment.match(/["']?allow_implicit_invocation["']?\s*:\s*([^,}]+)/);
-      if (inner) {
-        const innerRaw = stripComment(inner[1] ?? "").trim();
-        if (markers.sidecar.exists) markers.sidecar.ambiguous = true;
-        markers.sidecar.exists = true;
-        const ci = classifyScalar(innerRaw);
-        if (ci.type === "boolean") {
-          markers.sidecar.isBoolean = true;
-          markers.sidecar.value = ci.booleanValue;
-        } else {
-          markers.sidecar.wrongType = true;
-          markers.sidecar.wrongTypeDetail = typeLabelForWarning(ci.type);
+    },
+    onMapping: ({ fullPath, valueWithoutComment }) => {
+      // inline policy mapping
+      if (fullPath === "policy" && valueWithoutComment.startsWith("{")) {
+        const inner = valueWithoutComment.match(/["']?allow_implicit_invocation["']?\s*:\s*([^,}]+)/);
+        if (inner) {
+          const innerRaw = stripComment(inner[1] ?? "").trim();
+          if (markers.sidecar.exists) markers.sidecar.ambiguous = true;
+          markers.sidecar.exists = true;
+          applyBooleanMarker(markers.sidecar, innerRaw);
         }
+        return;
       }
-      continue;
-    }
 
-    if (fullPath === "policy.allow_implicit_invocation") {
-      markers.sidecar.exists = true;
-      const ci = classifyScalar(valueWithoutComment);
-      if (ci.type === "boolean") {
-        markers.sidecar.isBoolean = true;
-        markers.sidecar.value = ci.booleanValue;
-      } else {
-        markers.sidecar.wrongType = true;
-        markers.sidecar.wrongTypeDetail = typeLabelForWarning(ci.type);
+      if (fullPath === "policy.allow_implicit_invocation") {
+        markers.sidecar.exists = true;
+        applyBooleanMarker(markers.sidecar, valueWithoutComment);
       }
-      continue;
-    }
-  }
+    },
+  });
 
-  return { markers, warnings, malformed, malformedMsg };
+  return { markers, warnings: walked.warnings, malformed: walked.malformed, malformedMsg: walked.malformedMsg };
 }
 
 export interface ClassifyInput {
@@ -364,7 +334,7 @@ export interface ClassifyResult {
   details: ClassifyDetails;
 }
 
-function errorMessage(e: unknown): string {
+export function errorMessage(e: unknown): string {
   if (e && typeof e === "object" && "message" in e && typeof (e as { message: unknown }).message === "string") {
     return (e as { message: string }).message;
   }

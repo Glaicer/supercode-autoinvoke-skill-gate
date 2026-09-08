@@ -8,6 +8,22 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const sourceDir = join(root, "src");
 const outputDir = join(root, "dist");
 
+function rewriteTypeScriptExtensions() {
+  const rewrite = (path) => {
+    const source = path.node.source;
+    if (!source?.value.startsWith(".")) return;
+    source.value = source.value.replace(/\.tsx?$/, ".js");
+  };
+
+  return {
+    visitor: {
+      ExportAllDeclaration: rewrite,
+      ExportNamedDeclaration: rewrite,
+      ImportDeclaration: rewrite,
+    },
+  };
+}
+
 await rm(outputDir, { recursive: true, force: true });
 await mkdir(outputDir, { recursive: true });
 
@@ -23,11 +39,11 @@ for (const file of files) {
     filename: input,
     configFile: false,
     babelrc: false,
+    plugins: [rewriteTypeScriptExtensions],
     presets: [[presetTypeScript]],
   });
   if (!result?.code) throw new Error(`build: Babel produced no output for ${file}`);
 
-  const output = result.code.replace(/(from\s+["'][^"']+)\.ts(["'])/g, "$1.js$2");
   const target = join(outputDir, `${file.slice(0, -extname(file).length)}.js`);
-  await writeFile(target, `${output}\n`);
+  await writeFile(target, `${result.code}\n`);
 }

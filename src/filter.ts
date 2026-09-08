@@ -1,4 +1,4 @@
-import { BUILTIN_LOCATION, classifyRecord } from "./policy.ts";
+import { BUILTIN_LOCATION, classifyRecord, errorMessage } from "./policy.ts";
 import path from "node:path";
 import { realpath as fsRealpath } from "node:fs/promises";
 
@@ -33,10 +33,6 @@ interface Block {
   text: string;
   index: number;
   end: number;
-}
-
-interface SkillEntry extends Block {
-  keep: boolean;
 }
 
 export interface CatalogFilter {
@@ -145,9 +141,74 @@ function errorCodeOf(e: unknown): { code?: unknown } {
   return {};
 }
 
-function errorMessage(e: unknown): string {
-  if (e && typeof e === "object" && "message" in e) return String((e as { message: unknown }).message);
-  return String(e);
+/** Identity selected by OpenCode for a `<skill>` record: the source of truth for policy. */
+function parseSkillIdentity(blockText: string): CatalogRecord {
+  const nameMatch = /<name>([\s\S]*?)<\/name>/.exec(blockText);
+  const locMatch = /<location>([\s\S]*?)<\/location>/.exec(blockText);
+  return {
+    name: decodeHtml(nameMatch?.[1]?.trim() ?? ""),
+    location: decodeHtml(locMatch?.[1]?.trim() ?? ""),
+  };
+}
+
+/** Inner text between the catalog HEADER/FOOTER, or null when the block has no catalog frame. */
+function getCatalogInner(catalogBlock: string): string | null {
+  const start = catalogBlock.indexOf(HEADER);
+  const end = catalogBlock.lastIndexOf(FOOTER);
+  if (start === -1 || end === -1) return null;
+  return catalogBlock.slice(start + HEADER.length, end);
+}
+
+/**
+ * Shared catalog-block surgery: collect `<skill>` records, ask `decideKeep`
+ * per record identity, and rebuild the block without dropped records.
+ * Returns the input unchanged when every record is kept.
+ */
+async function rebuildCatalogBlock(
+  catalogBlock: string,
+  decideKeep: (record: CatalogRecord, index: number) => boolean | Promise<boolean>,
+): Promise<string> {
+  const inner = getCatalogInner(catalogBlock);
+  if (inner === null) return catalogBlock;
+  const skillRegex = /<skill>[\s\S]*?<\/skill>/g;
+  const skillBlocks = collectBlocks(inner, skillRegex);
+  if (skillBlocks.length === 0) return catalogBlock;
+  const keepFlags: boolean[] = [];
+  for (let i = 0; i < skillBlocks.length; i++) {
+    keepFlags.push(await decideKeep(parseSkillIdentity((skillBlocks[i] as Block).text), i));
+  }
+  if (keepFlags.every(Boolean)) return catalogBlock;
+  return HEADER + rebuildFiltered(inner, skillBlocks, (_block, i) => keepFlags[i] ?? true) + FOOTER;
+}
+
+/**
+ * Shared system-text surgery: map every `<available_skills>` block through
+ * `mapBlock` and splice the results back byte-for-byte around them.
+ */
+async function rewriteSystemText(
+  sys: string,
+  mapBlock: (blockText: string) => Promise<string>,
+): Promise<{ text: string; changed: boolean }> {
+  const catalogRegex = /<available_skills>[\s\S]*?<\/available_skills>/g;
+  const catalogBlocks = collectBlocks(sys, catalogRegex);
+  if (catalogBlocks.length === 0) return { text: sys, changed: false };
+  const filteredBlocks: string[] = [];
+  let hasChange = false;
+  for (const block of catalogBlocks) {
+    const filtered = await mapBlock(block.text);
+    if (filtered !== block.text) hasChange = true;
+    filteredBlocks.push(filtered);
+  }
+  if (!hasChange) return { text: sys, changed: false };
+  let newSys = "";
+  let lastIndex = 0;
+  for (let j = 0; j < catalogBlocks.length; j++) {
+    const block = catalogBlocks[j] as Block;
+    newSys += sys.slice(lastIndex, block.index) + (filteredBlocks[j] ?? "");
+    lastIndex = block.end;
+  }
+  newSys += sys.slice(lastIndex);
+  return { text: newSys, changed: true };
 }
 
 async function filterSingleCatalogBlockPerCall(
@@ -155,36 +216,15 @@ async function filterSingleCatalogBlockPerCall(
   readFile: ReadFile,
   realpathFn: RealpathFn | null,
 ): Promise<string> {
-  const start = catalogBlock.indexOf(HEADER);
-  const end = catalogBlock.lastIndexOf(FOOTER);
-  if (start === -1 || end === -1) return catalogBlock;
-  const inner = catalogBlock.slice(start + HEADER.length, end);
-
-  const skillRegex = /<skill>[\s\S]*?<\/skill>/g;
-  const skillBlocks = collectBlocks(inner, skillRegex);
-  if (skillBlocks.length === 0) return catalogBlock;
-
-  const entries: SkillEntry[] = [];
-  for (const block of skillBlocks) {
-    const locMatch = /<location>([\s\S]*?)<\/location>/.exec(block.text);
-    const rawLoc = locMatch?.[1]?.trim() ?? "";
-    const loc = decodeHtml(rawLoc);
-    let keep = true;
-    if (loc !== "" && loc !== BUILTIN_LOCATION) {
-      try {
-        const { explicitOnly } = await evaluateExplicitOnly(loc, readFile, realpathFn);
-        keep = !explicitOnly;
-      } catch {
-        keep = true;
-      }
+  return rebuildCatalogBlock(catalogBlock, async ({ location }) => {
+    if (location === "" || location === BUILTIN_LOCATION) return true;
+    try {
+      const { explicitOnly } = await evaluateExplicitOnly(location, readFile, realpathFn);
+      return !explicitOnly;
+    } catch {
+      return true;
     }
-    entries.push({ ...block, keep });
-  }
-
-  if (entries.every((e) => e.keep)) return catalogBlock;
-
-  const newInner = rebuildFiltered(inner, skillBlocks, (_block, i) => entries[i]?.keep ?? true);
-  return HEADER + newInner + FOOTER;
+  });
 }
 
 function extractDistinctRecords(output: SystemOutput): Map<string, CatalogRecord> {
@@ -196,20 +236,13 @@ function extractDistinctRecords(output: SystemOutput): Map<string, CatalogRecord
     if (typeof sys !== "string" || !sys.includes(HEADER)) continue;
     const catalogBlocks = collectBlocks(sys, catalogRegex);
     for (const cBlock of catalogBlocks) {
-      const start = cBlock.text.indexOf(HEADER);
-      const end = cBlock.text.lastIndexOf(FOOTER);
-      if (start === -1 || end === -1) continue;
-      const inner = cBlock.text.slice(start + HEADER.length, end);
+      const inner = getCatalogInner(cBlock.text);
+      if (inner === null) continue;
       const skillBlocks = collectBlocks(inner, skillRegex);
       for (const sBlock of skillBlocks) {
-        const nameMatch = /<name>([\s\S]*?)<\/name>/.exec(sBlock.text);
-        const locMatch = /<location>([\s\S]*?)<\/location>/.exec(sBlock.text);
-        const rawName = nameMatch?.[1]?.trim() ?? "";
-        const rawLoc = locMatch?.[1]?.trim() ?? "";
-        const name = decodeHtml(rawName);
-        const loc = decodeHtml(rawLoc);
-        const key = `${name}\0${loc}`;
-        if (!distinct.has(key)) distinct.set(key, { name, location: loc });
+        const { name, location } = parseSkillIdentity(sBlock.text);
+        const key = `${name}\0${location}`;
+        if (!distinct.has(key)) distinct.set(key, { name, location });
       }
     }
   }
@@ -220,35 +253,12 @@ async function filterSingleCatalogBlockWithSnapshot(
   catalogBlock: string,
   snapshot: Map<string, boolean>,
 ): Promise<string> {
-  const start = catalogBlock.indexOf(HEADER);
-  const end = catalogBlock.lastIndexOf(FOOTER);
-  if (start === -1 || end === -1) return catalogBlock;
-  const inner = catalogBlock.slice(start + HEADER.length, end);
-
-  const skillRegex = /<skill>[\s\S]*?<\/skill>/g;
-  const skillBlocks = collectBlocks(inner, skillRegex);
-  if (skillBlocks.length === 0) return catalogBlock;
-
-  const keepFlags: boolean[] = [];
-  for (const block of skillBlocks) {
-    const nameMatch = /<name>([\s\S]*?)<\/name>/.exec(block.text);
-    const locMatch = /<location>([\s\S]*?)<\/location>/.exec(block.text);
-    const rawName = nameMatch?.[1]?.trim() ?? "";
-    const rawLoc = locMatch?.[1]?.trim() ?? "";
-    const name = decodeHtml(rawName);
-    const loc = decodeHtml(rawLoc);
-    const key = `${name}\0${loc}`;
-    let keep = true;
-    if (loc === "" || loc === BUILTIN_LOCATION) keep = true;
-    else if (snapshot.has(key)) keep = !snapshot.get(key);
-    else keep = true;
-    keepFlags.push(keep);
-  }
-
-  if (keepFlags.every(Boolean)) return catalogBlock;
-
-  const newInner = rebuildFiltered(inner, skillBlocks, (_b, i) => keepFlags[i] ?? true);
-  return HEADER + newInner + FOOTER;
+  return rebuildCatalogBlock(catalogBlock, ({ name, location }) => {
+    if (location === "" || location === BUILTIN_LOCATION) return true;
+    const key = `${name}\0${location}`;
+    if (snapshot.has(key)) return !snapshot.get(key);
+    return true;
+  });
 }
 
 export async function filterSystem(
@@ -257,30 +267,14 @@ export async function filterSystem(
   realpathFn: RealpathFn | null = null,
 ): Promise<void> {
   if (!output || !Array.isArray(output.system)) return;
-  const catalogRegex = /<available_skills>[\s\S]*?<\/available_skills>/g;
   const system = output.system as unknown[];
   for (let i = 0; i < system.length; i++) {
     const sys = system[i];
     if (typeof sys !== "string" || !sys.includes(HEADER)) continue;
-    const catalogBlocks = collectBlocks(sys, catalogRegex);
-    if (catalogBlocks.length === 0) continue;
-    const filteredBlocks: string[] = [];
-    let hasChange = false;
-    for (const block of catalogBlocks) {
-      const filtered = await filterSingleCatalogBlockPerCall(block.text, readFile, realpathFn);
-      if (filtered !== block.text) hasChange = true;
-      filteredBlocks.push(filtered);
-    }
-    if (!hasChange) continue;
-    let newSys = "";
-    let lastIndex = 0;
-    for (let j = 0; j < catalogBlocks.length; j++) {
-      const block = catalogBlocks[j] as Block;
-      newSys += sys.slice(lastIndex, block.index) + (filteredBlocks[j] ?? "");
-      lastIndex = block.end;
-    }
-    newSys += sys.slice(lastIndex);
-    system[i] = newSys;
+    const { text, changed } = await rewriteSystemText(sys, (block) =>
+      filterSingleCatalogBlockPerCall(block, readFile, realpathFn),
+    );
+    if (changed) system[i] = text;
   }
 }
 
@@ -367,29 +361,14 @@ export function createCatalogFilter(readFile: ReadFile, options: CatalogFilterOp
 
     if (snapshot === null) return;
 
-    const catalogRegex = /<available_skills>[\s\S]*?<\/available_skills>/g;
+    const snap = snapshot;
     for (let i = 0; i < system.length; i++) {
       const sys = system[i];
       if (typeof sys !== "string" || !sys.includes(HEADER)) continue;
-      const catalogBlocks = collectBlocks(sys, catalogRegex);
-      if (catalogBlocks.length === 0) continue;
-      const filteredBlocks: string[] = [];
-      let hasChange = false;
-      for (const block of catalogBlocks) {
-        const filtered = await filterSingleCatalogBlockWithSnapshot(block.text, snapshot);
-        if (filtered !== block.text) hasChange = true;
-        filteredBlocks.push(filtered);
-      }
-      if (!hasChange) continue;
-      let newSys = "";
-      let lastIndex = 0;
-      for (let j = 0; j < catalogBlocks.length; j++) {
-        const block = catalogBlocks[j] as Block;
-        newSys += sys.slice(lastIndex, block.index) + (filteredBlocks[j] ?? "");
-        lastIndex = block.end;
-      }
-      newSys += sys.slice(lastIndex);
-      system[i] = newSys;
+      const { text, changed } = await rewriteSystemText(sys, (block) =>
+        filterSingleCatalogBlockWithSnapshot(block, snap),
+      );
+      if (changed) system[i] = text;
     }
   }) as CatalogFilter;
 
