@@ -1,11 +1,25 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "supercode-autoinvoke-skill-gate",
+  "name": "@glaicer/supercode-autoinvoke-skill-gate",
   "version": "0.1.0",
   "description": "OpenCode plugin that hides Explicit-only skills (Claude Code, Codex, OpenCode v2 portable markers) from the model-facing <available_skills> catalog",
   "type": "module",
   "license": "MIT",
-  "author": "Supercode",
+  "author": "Dmitrii Aronov <aronov.mml@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Glaicer/supercode-autoinvoke-skill-gate.git"
+  },
+  "homepage": "https://github.com/Glaicer/supercode-autoinvoke-skill-gate#readme",
+  "bugs": {
+    "url": "https://github.com/Glaicer/supercode-autoinvoke-skill-gate/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "skills",
+    "autoinvoke-skill-gate"
+  ],
   "main": "./dist/gate.js",
   "exports": {
     ".": "./dist/gate.js",
@@ -13,8 +27,7 @@
     "./policy": "./dist/policy.js"
   },
   "files": [
-    "dist",
-    "README.md"
+    "dist"
   ],
   "publishConfig": {
     "access": "public"

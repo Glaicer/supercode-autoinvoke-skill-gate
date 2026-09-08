@@ -4,18 +4,22 @@ OpenCode `v1` plugin that hides Explicit-only skills from the model-facing `<ava
 
 ## Install
 
+Install with the OpenCode CLI:
+
+```bash
+opencode plugin @glaicer/supercode-autoinvoke-skill-gate
+```
+
+- `--global` installs into the global config (`~/.config/opencode`); default is local (`.opencode` in the current project).
+- `--force` replaces an already-installed version.
+- Restart OpenCode after installing.
+
+Manual install also works: add the package to the `plugin` array in `opencode.json` (global `~/.config/opencode/opencode.json` or local `<project>/opencode.json`):
+
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["supercode-autoinvoke-skill-gate"]
-}
-```
-
-Or with npm auto-install:
-
-```json
-{
-  "plugin": ["supercode-autoinvoke-skill-gate@latest"]
+  "plugin": ["@glaicer/supercode-autoinvoke-skill-gate"]
 }
 ```
 
