@@ -6,26 +6,34 @@
   "type": "module",
   "license": "MIT",
   "author": "Supercode",
-  "main": "./plugin/gate.js",
+  "main": "./dist/gate.js",
   "exports": {
-    ".": "./plugin/gate.js",
-    "./filter": "./src/filter.js",
-    "./policy": "./src/policy.js"
+    ".": "./dist/gate.js",
+    "./filter": "./dist/filter.js",
+    "./policy": "./dist/policy.js"
   },
   "files": [
-    "plugin/gate.js",
-    "src/filter.js",
-    "src/policy.js",
+    "dist",
     "README.md"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "test": "node --test"
+    "build": "node scripts/build.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "prepack": "npm run build && npm run check:package",
+    "test": "node --test 'src/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@babel/core": "7.28.0",
+    "@babel/preset-typescript": "7.27.1",
+    "@types/node": "24.13.3",
+    "typescript": "5.8.2"
   },
   "engines": {
-    "node": ">=20",
+    "node": ">=24",
     "opencode": ">=1.14.17 <2"
   }
 }

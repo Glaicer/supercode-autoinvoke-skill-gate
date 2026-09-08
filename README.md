@@ -89,10 +89,15 @@ Only unquoted booleans count. `disable-model-invocation: "true"` stays visible (
 ## Verify
 
 ```sh
+npm run typecheck
+npm run build
 npm test
+npm run check:package
 ```
 
-Tests run via the Catalog Policy/Filter seam (`src/filter.js` + `src/policy.js`) and cover: three markers, ANY-denial, conflicts, exact YAML boolean vs quoted/number/null/array, malformed/read errors, duplicate names with different locations, symlink alias, and immutable snapshot (unknown identities preserved fail-open).
+Sources are TypeScript (`src/*.ts`); the published artifact is compiled JavaScript (`dist/*.js`, built via `scripts/build.mjs` with Babel type-stripping).
+
+Tests run uncompiled via Node 24 native type-stripping through the Catalog Policy/Filter seam (`src/filter.ts` + `src/policy.ts`) and cover: three markers, ANY-denial, conflicts, exact YAML boolean vs quoted/number/null/array, malformed/read errors, duplicate names with different locations, symlink alias (including the `createCatalogFilter(readFile, realpathFn)` overload), and immutable snapshot (unknown identities preserved fail-open).
 
 ## Uninstall
 
