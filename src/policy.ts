@@ -187,10 +187,18 @@ export function walkYamlLines(yamlText: string, handlers: YamlWalkHandlers): Yam
   let malformedMsg: string | null = null;
   const seen = new Map<string, number>();
   const stack: StackFrame[] = [];
+  // Indent of the key that opened a `|`/`>` block scalar, or null outside one.
+  // Continuation lines (blank or deeper-indented) are content, not mappings.
+  let blockIndent: number | null = null;
 
   for (let idx = 0; idx < lines.length; idx++) {
     const rawLine: string = lines[idx] ?? "";
     const trimmed = rawLine.trim();
+    const indent = rawLine.length - rawLine.trimStart().length;
+    if (blockIndent !== null) {
+      if (trimmed === "" || indent > blockIndent) continue;
+      blockIndent = null;
+    }
     if (trimmed === "" || trimmed.startsWith("#")) continue;
     const kvMatch = rawLine.match(/^(\s*)([^:]+?)\s*:\s*(.*)$/);
     if (!kvMatch) {
@@ -200,11 +208,11 @@ export function walkYamlLines(yamlText: string, handlers: YamlWalkHandlers): Yam
       }
       continue;
     }
-    const indent = (kvMatch[1] || "").length;
+    const keyIndent = (kvMatch[1] || "").length;
     const key = unquoteKey(kvMatch[2] ?? "");
     const rawValueFull = kvMatch[3] ?? "";
 
-    while (stack.length > 0 && indent <= (stack[stack.length - 1]?.indent ?? 0)) stack.pop();
+    while (stack.length > 0 && keyIndent <= (stack[stack.length - 1]?.indent ?? 0)) stack.pop();
     const parentPath = stack.map((s) => s.key).join(".");
     const fullPath = parentPath ? `${parentPath}.${key}` : key;
 
@@ -216,6 +224,14 @@ export function walkYamlLines(yamlText: string, handlers: YamlWalkHandlers): Yam
     seen.set(fullPath, seenCount + 1);
 
     const valueWithoutComment = stripComment(rawValueFull).trim();
+
+    if (/^[|>][+-]?\d*$/.test(valueWithoutComment)) {
+      // Block scalar header (`|`, `>`, `|-`, `>+2`, …): the value lives on the
+      // following deeper-indented lines; report the mapping, then skip them.
+      handlers.onMapping({ fullPath, valueWithoutComment });
+      blockIndent = keyIndent;
+      continue;
+    }
 
     if (valueWithoutComment.startsWith("[") && !valueWithoutComment.includes("]")) {
       malformed = true;
@@ -230,7 +246,7 @@ export function walkYamlLines(yamlText: string, handlers: YamlWalkHandlers): Yam
 
     if (valueWithoutComment === "") {
       // Map node or empty value: push for nested handling regardless.
-      stack.push({ indent, key });
+      stack.push({ indent: keyIndent, key });
       continue;
     }
 

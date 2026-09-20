@@ -18,6 +18,11 @@ for (const entry of ["./dist/gate.js", "./dist/filter.js", "./dist/policy.js"]) 
 
 const gateCode = readFileSync(resolve(root, "./dist/gate.js"), "utf8");
 assert.match(gateCode, /export default /, "compiled gate must keep a default export for loaders that require one");
+assert.doesNotMatch(
+  gateCode,
+  /from ["']@opencode\/plugin["']/,
+  "compiled gate must stay runtime dependency-free (@opencode/plugin is types-only)",
+);
 
 const packed = JSON.parse(
   execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {

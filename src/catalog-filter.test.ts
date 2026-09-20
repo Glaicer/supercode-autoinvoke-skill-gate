@@ -340,6 +340,61 @@ test("filterSystem recognizes sidecar policy.allow_implicit_invocation: false as
   assert.doesNotMatch((out.system as string[])[0] as string, /\/s\/SKILL\.md/);
 });
 
+test("filterSystem skips YAML block-scalar content, still sees markers after it", async () => {
+  const mdLiteral = `---
+name: lit
+description: |
+  Multiline literal with a colon: inside
+  and a second line without one
+disable-model-invocation: true
+---
+body`;
+  const mdFolded = `---
+name: fold
+description: >-
+  Folded text spanning
+  several lines
+disable-model-invocation: true
+---
+body`;
+  const mdNoMarker = `---
+name: plain
+description: |
+  Just a multiline description
+  with no marker anywhere
+---
+body`;
+  const r1 = classifyRecord({ skillContent: mdLiteral, sidecarMissing: true });
+  assert.equal(r1.explicitOnly, true);
+  assert.equal(r1.warnings.length, 0);
+  const r2 = classifyRecord({ skillContent: mdFolded, sidecarMissing: true });
+  assert.equal(r2.explicitOnly, true);
+  assert.equal(r2.warnings.length, 0);
+  const r3 = classifyRecord({ skillContent: mdNoMarker, sidecarMissing: true });
+  assert.equal(r3.explicitOnly, false);
+  assert.equal(r3.warnings.length, 0);
+
+  const map = new Map([
+    ["/l/SKILL.md", mdLiteral],
+    ["/f/SKILL.md", mdFolded],
+    ["/p/SKILL.md", mdNoMarker],
+  ]);
+  const out: SystemOutput = {
+    system: [
+      catalog([
+        skillEntry("l", "L", "/l/SKILL.md"),
+        skillEntry("f", "F", "/f/SKILL.md"),
+        skillEntry("p", "P", "/p/SKILL.md"),
+      ]),
+    ],
+  };
+  await filterSystem(out, reader(map));
+  const res = (out.system as string[])[0] as string;
+  assert.doesNotMatch(res, /\/l\/SKILL\.md/);
+  assert.doesNotMatch(res, /\/f\/SKILL\.md/);
+  assert.match(res, /\/p\/SKILL\.md/);
+});
+
 test("only YAML boolean counts — quoted, number, null, array stay visible", async () => {
   const mdQuotedMeta = META_QUOTED_MD;
   const mdNum = `---
