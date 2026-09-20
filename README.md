@@ -40,7 +40,7 @@ Only real booleans count (`true` / `false`, no quotes).
 Install with the OpenCode CLI:
 
 ```bash
-opencode plugin @glaicer/supercode-autoinvoke-skill-gate --global
+opencode plugin add @glaicer/supercode-autoinvoke-skill-gate
 ```
 
 - `--global` installs into the global config (`~/.config/opencode`); default is local (`.opencode` in the current project).
